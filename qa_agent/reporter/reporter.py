@@ -45,7 +45,7 @@ def _format_failure_deep_dives(eval_results: list[EvalResult]) -> str:
     failures = [r for r in eval_results if not r.passed]
     if not failures:
         return ""
-    lines = ["\n=== FAILURE DEEP-DIVES ==="]
+    lines = ["\n=== FAILURE DEEP-DIVE ==="]
     for r in failures:
         tc = r.run_result.test_case
         lines.append(f"\n[{tc.id}] {tc.description} ({tc.category})")
