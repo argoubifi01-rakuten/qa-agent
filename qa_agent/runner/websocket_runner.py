@@ -48,6 +48,7 @@ class WebSocketRunner(Runner):
             auth_resp = client.post(
                 self._config.target.auth_url,
                 headers={"x-secret": self._config.target_auth_secret},
+                timeout=timeout,
             )
             auth_resp.raise_for_status()
             access_token = auth_resp.json()["accessToken"]
@@ -55,6 +56,7 @@ class WebSocketRunner(Runner):
             thread_resp = client.post(
                 self._config.target.thread_creation_url,
                 headers={"Authorization": f"Bearer {access_token}"},
+                timeout=timeout,
             )
             thread_resp.raise_for_status()
             thread_id = thread_resp.json()["id"]

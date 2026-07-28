@@ -93,3 +93,37 @@ def test_multiple_run_results(config):
     assert results[0].passed is True
     assert results[1].passed is False
     mock_client.messages.stream.assert_called_once()
+
+
+def test_llm_failure_marks_result_failed_and_continues(config):
+    rrs = [
+        _make_run_result(success=True, response="Good answer"),
+        _make_run_result(success=True, response="Another answer"),
+    ]
+    call_count = 0
+
+    def stream_side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("API rate limit exceeded")
+        mock_message = MagicMock()
+        mock_message.content = [MagicMock(text=json.dumps({
+            "passed": True, "score": 0.9, "rationale": "Good.", "failure_detail": None
+        }))]
+        mock_stream = MagicMock()
+        mock_stream.get_final_message.return_value = mock_message
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_stream)
+        ctx.__exit__ = MagicMock(return_value=False)
+        return ctx
+
+    mock_client = MagicMock()
+    mock_client.messages.stream.side_effect = stream_side_effect
+    with patch("qa_agent.evaluator.evaluator.anthropic.Anthropic", return_value=mock_client):
+        results = evaluate(rrs, description="bot", prompt=None, config=config)
+
+    assert len(results) == 2
+    assert results[0].passed is False
+    assert "API rate limit exceeded" in results[0].rationale
+    assert results[1].passed is True

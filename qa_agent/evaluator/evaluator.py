@@ -61,26 +61,35 @@ def evaluate(
             ))
             continue
 
-        user_msg = _build_eval_prompt(rr, description, prompt)
-        with client.messages.stream(
-            model=config.qa_llm.model,
-            max_tokens=1024,
-            thinking={"type": "adaptive"},
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        ) as stream:
-            message = stream.get_final_message()
+        try:
+            user_msg = _build_eval_prompt(rr, description, prompt)
+            with client.messages.stream(
+                model=config.qa_llm.model,
+                max_tokens=1024,
+                thinking={"type": "adaptive"},
+                system=_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_msg}],
+            ) as stream:
+                message = stream.get_final_message()
 
-        text = next(
-            (block.text for block in message.content if hasattr(block, "text")), "{}"
-        )
-        data = json.loads(text)
-        results.append(EvalResult(
-            run_result=rr,
-            passed=bool(data.get("passed", False)),
-            score=float(data.get("score", 0.0)),
-            rationale=data.get("rationale", ""),
-            failure_detail=data.get("failure_detail"),
-        ))
+            text = next(
+                (block.text for block in message.content if hasattr(block, "text")), "{}"
+            )
+            data = json.loads(text)
+            results.append(EvalResult(
+                run_result=rr,
+                passed=bool(data.get("passed", False)),
+                score=float(data.get("score", 0.0)),
+                rationale=data.get("rationale", ""),
+                failure_detail=data.get("failure_detail"),
+            ))
+        except Exception as exc:
+            results.append(EvalResult(
+                run_result=rr,
+                passed=False,
+                score=0.0,
+                rationale=f"Evaluation failed: {exc}",
+                failure_detail=str(exc),
+            ))
 
     return results
