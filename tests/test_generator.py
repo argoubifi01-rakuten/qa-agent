@@ -1,26 +1,47 @@
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from qa_agent.models import TestCase
 from qa_agent.generator.generator import generate_test_cases
 from qa_agent.config import Config, QALLMConfig, TargetConfig, TestGenerationConfig
 
 
+@pytest.fixture(autouse=True)
+def no_override():
+    """Prevent test_cases_override.yaml from being picked up during tests."""
+    with patch("qa_agent.generator.generator._load_override", return_value=None):
+        yield
+
+
 @pytest.fixture
 def config():
     return Config(
-        qa_llm=QALLMConfig(provider="anthropic", model="claude-opus-5"),
+        qa_llm=QALLMConfig(provider="openai", model="gpt-4o"),
         target=TargetConfig(
             websocket_url="wss://x/ws",
             auth_url="https://x/auth",
             thread_creation_url="https://x/threads",
+            scenario_id="test-scenario",
             wss_response_timeout=30,
         ),
         test_generation=TestGenerationConfig(num_test_cases=3, max_turns=1),
         qa_llm_api_key="test-key",
-        target_auth_secret="test-secret",
+        eval_mock_secret="mock-secret",
+        mongodb_uri="mongodb://localhost/testdb",
     )
 
+
+AGENT_CONTEXT = """\
+# Agent: Shopping Assistant
+
+## Purpose
+Helps users find and purchase products on Rakuten.
+
+## Capabilities
+- Product search
+- Price filtering
+- Recommendations
+"""
 
 VALID_LLM_RESPONSE = json.dumps({
     "test_cases": [
@@ -48,74 +69,113 @@ VALID_LLM_RESPONSE = json.dumps({
     ]
 })
 
+MULTI_TURN_LLM_RESPONSE = json.dumps({
+    "test_cases": [
+        {
+            "id": "tc-001",
+            "description": "Agent shows clarification form then completes shopping search",
+            "category": "general",
+            "goal": "After filling the form the agent returns product results",
+            "input_message": "I want to buy something",
+            "follow_up_messages": ["I'm looking for a red Nike running shoe under $100"],
+        },
+        {
+            "id": "tc-002",
+            "description": "Clear query needs no clarification",
+            "category": "general",
+            "goal": "Agent returns results without asking for clarification",
+            "input_message": "Show me blue Nike running shoes under $80",
+            "follow_up_messages": None,
+        },
+    ]
+})
 
-def _make_mock_client(response_text: str):
-    mock_message = MagicMock()
-    mock_message.content = [MagicMock(text=response_text)]
-    mock_stream = MagicMock()
-    mock_stream.get_final_message.return_value = mock_message
-    mock_client = MagicMock()
-    mock_client.messages.stream.return_value.__enter__ = MagicMock(return_value=mock_stream)
-    mock_client.messages.stream.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_client
+DRIVER_INSTRUCTIONS_LLM_RESPONSE = json.dumps({
+    "test_cases": [
+        {
+            "id": "tc-001",
+            "description": "Conditional clarification form test",
+            "category": "general",
+            "goal": "Agent either asks for clarification or returns results directly",
+            "input_message": "I want shoes",
+            "driver_instructions": (
+                "If the agent shows a clarification form, fill it with "
+                "'red Nike running shoes size 10 under $100'. "
+                "If the agent returns product results directly, verify they are "
+                "relevant and mark done."
+            ),
+        },
+    ]
+})
 
 
-def test_generate_from_description_only(config):
-    mock_client = _make_mock_client(VALID_LLM_RESPONSE)
-    with patch("qa_agent.generator.generator.anthropic.Anthropic", return_value=mock_client):
-        cases = generate_test_cases(description="A customer support bot", prompt=None, config=config)
+def test_generate_returns_test_cases(config):
+    with patch("qa_agent.generator.generator.call_llm", return_value=VALID_LLM_RESPONSE):
+        cases = generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
     assert len(cases) == 3
     assert all(isinstance(c, TestCase) for c in cases)
     assert cases[0].id == "tc-001"
     assert cases[1].category == "edge_case"
 
 
-def test_generate_from_prompt_only(config):
-    mock_client = _make_mock_client(VALID_LLM_RESPONSE)
-    with patch("qa_agent.generator.generator.anthropic.Anthropic", return_value=mock_client):
-        cases = generate_test_cases(description=None, prompt="You are a helpful assistant.", config=config)
-    assert len(cases) == 3
+def test_generate_makes_one_llm_call(config):
+    with patch("qa_agent.generator.generator.call_llm", return_value=VALID_LLM_RESPONSE) as mock_llm:
+        generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
+    assert mock_llm.call_count == 1
 
 
-def test_generate_from_both(config):
-    mock_client = _make_mock_client(VALID_LLM_RESPONSE)
-    with patch("qa_agent.generator.generator.anthropic.Anthropic", return_value=mock_client):
-        cases = generate_test_cases(
-            description="Customer support bot",
-            prompt="You are a helpful assistant.",
-            config=config,
-        )
-    assert len(cases) == 3
+def test_generate_passes_context_to_llm(config):
+    captured = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return VALID_LLM_RESPONSE
+
+    with patch("qa_agent.generator.generator.call_llm", side_effect=capture):
+        generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
+
+    assert "Shopping Assistant" in captured["user"]
 
 
 def test_malformed_json_retries_once(config):
-    bad_response = '{"test_cases": [invalid}'
-    good_response = VALID_LLM_RESPONSE
     call_count = 0
 
-    def stream_side_effect(*args, **kwargs):
+    def side_effect(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        text = bad_response if call_count == 1 else good_response
-        mock_message = MagicMock()
-        mock_message.content = [MagicMock(text=text)]
-        mock_stream = MagicMock()
-        mock_stream.get_final_message.return_value = mock_message
-        ctx = MagicMock()
-        ctx.__enter__ = MagicMock(return_value=mock_stream)
-        ctx.__exit__ = MagicMock(return_value=False)
-        return ctx
+        if call_count == 1:
+            return '{"test_cases": [invalid}'
+        return VALID_LLM_RESPONSE
 
-    mock_client = MagicMock()
-    mock_client.messages.stream.side_effect = stream_side_effect
-    with patch("qa_agent.generator.generator.anthropic.Anthropic", return_value=mock_client):
-        cases = generate_test_cases(description="bot", prompt=None, config=config)
+    with patch("qa_agent.generator.generator.call_llm", side_effect=side_effect):
+        cases = generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
     assert call_count == 2
     assert len(cases) == 3
 
 
 def test_malformed_json_raises_after_two_failures(config):
-    mock_client = _make_mock_client('{"test_cases": [invalid}')
-    with patch("qa_agent.generator.generator.anthropic.Anthropic", return_value=mock_client):
+    with patch("qa_agent.generator.generator.call_llm", return_value='{"test_cases": [invalid}'):
         with pytest.raises(ValueError, match="Failed to parse"):
-            generate_test_cases(description="bot", prompt=None, config=config)
+            generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
+
+
+def test_follow_up_messages_parsed(config):
+    with patch("qa_agent.generator.generator.call_llm", return_value=MULTI_TURN_LLM_RESPONSE):
+        cases = generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
+    assert cases[0].follow_up_messages == ["I'm looking for a red Nike running shoe under $100"]
+    assert cases[1].follow_up_messages is None
+
+
+def test_missing_follow_up_messages_defaults_to_none(config):
+    with patch("qa_agent.generator.generator.call_llm", return_value=VALID_LLM_RESPONSE):
+        cases = generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
+    assert all(c.follow_up_messages is None for c in cases)
+    assert all(c.driver_instructions is None for c in cases)
+
+
+def test_driver_instructions_parsed(config):
+    with patch("qa_agent.generator.generator.call_llm", return_value=DRIVER_INSTRUCTIONS_LLM_RESPONSE):
+        cases = generate_test_cases(agent_context=AGENT_CONTEXT, config=config)
+    assert cases[0].driver_instructions is not None
+    assert "clarification form" in cases[0].driver_instructions
+    assert cases[0].follow_up_messages is None

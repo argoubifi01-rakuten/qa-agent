@@ -7,12 +7,17 @@ name = "qa-agent"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.49.0",
+    "openai>=1.0.0",
     "websockets>=13.0",
     "httpx>=0.27.0",
     "pyyaml>=6.0",
     "python-dotenv>=1.0.0",
+    "google-cloud-firestore>=2.16.0",
+    "certifi>=2024.0.0",
 ]
+
+[project.optional-dependencies]
+mongo = ["pymongo>=4.6.0"]
 
 [project.scripts]
 qa-agent = "qa_agent.cli:main"

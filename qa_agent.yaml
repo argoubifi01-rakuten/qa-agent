@@ -1,13 +1,23 @@
 qa_llm:
-  provider: anthropic
-  model: claude-opus-5
+  provider: openai
+  model: gpt-4o
 
 target:
-  websocket_url: wss://your-backend/ws
-  auth_url: https://your-backend/api/v2/auth/anonymous
-  thread_creation_url: https://your-backend/api/v2/threads
+  websocket_url: wss://companion.devspace.ai.public.rakuten-it.com
+  auth_url: https://companion.devspace.ai.public.rakuten-it.com/api/v2/auth/anonymous
+  thread_creation_url: https://companion.devspace.ai.public.rakuten-it.com/api/v1/thread
   wss_response_timeout: 120
+  scenario_id: 6a5820569a280d2db9236800
 
 test_generation:
-  num_test_cases: 10
-  max_turns: 1
+  num_test_cases: 20
+  max_turns: 3
+
+# Optional: seed test cases from real production queries fetched from trace-analyser.
+# Remove this block (or leave url blank) to use purely synthetic generation.
+trace_analyser:
+  url: ""                  # set to http://localhost:8000 or your deployed URL
+  dataset: ""              # if set, fetch items from this named dataset; ignores filters below
+  tool_filter: ""          # only fetch traces that used this tool (e.g. "shopping")
+  score_filter: ""         # only fetch traces with this score (e.g. "tool_error")
+  limit: 20                # max production queries to fetch

@@ -15,6 +15,7 @@ class TargetConfig:
     websocket_url: str
     auth_url: str
     thread_creation_url: str
+    scenario_id: str
     wss_response_timeout: int = 120
 
 
@@ -25,12 +26,23 @@ class TestGenerationConfig:
 
 
 @dataclass
+class TraceAnalyserConfig:
+    url: str
+    dataset: str | None = None
+    tool_filter: str | None = None
+    score_filter: str | None = None
+    limit: int = 20
+
+
+@dataclass
 class Config:
     qa_llm: QALLMConfig
     target: TargetConfig
     test_generation: TestGenerationConfig
     qa_llm_api_key: str
-    target_auth_secret: str
+    eval_mock_secret: str
+    mongodb_uri: str | None  # None → use Firestore via ADC (no VPN required)
+    trace_analyser: TraceAnalyserConfig | None = None
 
 
 def load_config(yaml_path: str) -> Config:
@@ -42,13 +54,14 @@ def load_config(yaml_path: str) -> Config:
         raw = yaml.safe_load(f)
 
     missing = []
-    api_key = os.environ.get("QA_LLM_API_KEY")
-    auth_secret = os.environ.get("TARGET_AUTH_SECRET")
+    api_key = os.environ.get("OPENAI_API_KEY")
+    eval_mock_secret = os.environ.get("EVAL_MOCK_SECRET")
+    mongodb_uri = os.environ.get("MONGODB_URI")  # optional — falls back to Firestore ADC
 
     if not api_key:
-        missing.append("QA_LLM_API_KEY")
-    if not auth_secret:
-        missing.append("TARGET_AUTH_SECRET")
+        missing.append("OPENAI_API_KEY")
+    if not eval_mock_secret:
+        missing.append("EVAL_MOCK_SECRET")
 
     if missing:
         raise EnvironmentError(
@@ -66,6 +79,7 @@ def load_config(yaml_path: str) -> Config:
             websocket_url=target_raw["websocket_url"],
             auth_url=target_raw["auth_url"],
             thread_creation_url=target_raw["thread_creation_url"],
+            scenario_id=target_raw["scenario_id"],
             wss_response_timeout=target_raw.get("wss_response_timeout", 120),
         ),
         test_generation=TestGenerationConfig(
@@ -73,5 +87,23 @@ def load_config(yaml_path: str) -> Config:
             max_turns=raw["test_generation"]["max_turns"],
         ),
         qa_llm_api_key=api_key,
-        target_auth_secret=auth_secret,
+        eval_mock_secret=eval_mock_secret,
+        mongodb_uri=mongodb_uri,
+        trace_analyser=_load_trace_analyser_config(raw),
+    )
+
+
+def _load_trace_analyser_config(raw: dict) -> "TraceAnalyserConfig | None":
+    ta_raw = raw.get("trace_analyser")
+    if not ta_raw:
+        url = os.environ.get("TRACE_ANALYSER_URL")
+        if not url:
+            return None
+        ta_raw = {"url": url}
+    return TraceAnalyserConfig(
+        url=ta_raw.get("url") or os.environ.get("TRACE_ANALYSER_URL", ""),
+        dataset=ta_raw.get("dataset"),
+        tool_filter=ta_raw.get("tool_filter"),
+        score_filter=ta_raw.get("score_filter"),
+        limit=ta_raw.get("limit", 20),
     )

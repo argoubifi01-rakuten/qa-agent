@@ -1,4 +1,12 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AgentIntent:
+    domain: str
+    core_capabilities: list[str]
+    description_prompt_gaps: list[str]
+    contradictions: list[str]
 
 
 @dataclass
@@ -8,12 +16,16 @@ class TestCase:
     category: str  # "general", "edge_case", "out_of_scope", "adversarial"
     goal: str
     input_message: str
+    follow_up_messages: list[str] | None = None  # scripted turns after the first
+    driver_instructions: str | None = None  # conditional guidance for the LLM driver
 
 
 @dataclass
 class Turn:
     sent: str
     received: str
+    trace_id: str | None = None
+    trace_url: str | None = None
 
 
 @dataclass

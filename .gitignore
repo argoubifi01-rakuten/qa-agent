@@ -10,3 +10,12 @@ build/
 .mypy_cache/
 .ruff_cache/
 *.egg
+
+# Generated run output (JSON files and agent context docs are local)
+runs/
+
+# Local Claude Code permission overrides
+.claude/settings.local.json
+
+# Scenario-specific test overrides (local to each user's setup)
+test_cases_override.yaml

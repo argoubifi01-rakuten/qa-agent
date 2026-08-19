@@ -1,7 +1,10 @@
 import json
-import anthropic
+import logging
+from qa_agent.llm import call_llm
 from qa_agent.models import EvalResult
 from qa_agent.config import Config
+
+logger = logging.getLogger(__name__)
 
 _NARRATIVE_SYSTEM = """\
 You are a QA analyst. Given test results for an LLM agent, write a concise narrative summary.
@@ -54,36 +57,84 @@ def _format_failure_deep_dives(eval_results: list[EvalResult]) -> str:
             lines.append(f"\n  Turn {i}:")
             lines.append(f"    Sent:     {turn.sent}")
             lines.append(f"    Received: {turn.received}")
+            if turn.trace_url:
+                lines.append(f"    Trace:    {turn.trace_url}")
+            elif turn.trace_id:
+                lines.append(f"    Trace ID: {turn.trace_id}")
         lines.append(f"\nRationale: {r.rationale}")
         if r.failure_detail:
             lines.append(f"Failure detail: {r.failure_detail}")
     return "\n".join(lines)
 
 
+def build_run_data(
+    eval_results: list[EvalResult],
+    description: str | None,
+    narrative: str,
+    advice: str | None,
+    scenario_id: str | None,
+    timestamp: str | None,
+    agent_context: str | None = None,
+) -> dict:
+    """Build the JSON-serialisable run payload used by storage and the web dashboard."""
+    total = len(eval_results)
+    passed = sum(1 for r in eval_results if r.passed)
+    return {
+        "timestamp": timestamp,
+        "scenario_id": scenario_id,
+        "purpose": description,
+        "agent_context": agent_context,
+        "summary": narrative,
+        "pass_rate": passed / total if total else 0.0,
+        "advice": advice,
+        "results": [
+            {
+                "id": r.run_result.test_case.id,
+                "description": r.run_result.test_case.description,
+                "category": r.run_result.test_case.category,
+                "goal": r.run_result.test_case.goal,
+                "passed": r.passed,
+                "score": r.score,
+                "rationale": r.rationale,
+                "failure_detail": r.failure_detail,
+                "turns": [
+                    {
+                        "sent": t.sent,
+                        "received": t.received,
+                        "trace_id": t.trace_id,
+                        "trace_url": t.trace_url,
+                    }
+                    for t in r.run_result.turns
+                ],
+            }
+            for r in eval_results
+        ],
+    }
+
+
 def report(
     eval_results: list[EvalResult],
     description: str | None,
     config: Config,
-    output_path: str | None,
-) -> int:
-    client = anthropic.Anthropic(api_key=config.qa_llm_api_key)
-    narrative_prompt = _build_narrative_prompt(eval_results, description)
-
-    with client.messages.stream(
-        model=config.qa_llm.model,
-        max_tokens=1024,
-        thinking={"type": "adaptive"},
-        system=_NARRATIVE_SYSTEM,
-        messages=[{"role": "user", "content": narrative_prompt}],
-    ) as stream:
-        message = stream.get_final_message()
-
-    narrative = next(
-        (block.text for block in message.content if hasattr(block, "text")), ""
-    )
-
+    scenario_id: str | None = None,
+    advice: str | None = None,
+    agent_context: str | None = None,
+    # kept for backwards compat with existing tests
+    output_path: str | None = None,
+) -> tuple[int, dict]:
+    """Print the report to stdout and return (exit_code, run_data)."""
     total = len(eval_results)
     passed = sum(1 for r in eval_results if r.passed)
+    logger.info("Generating report: %d/%d passed", passed, total)
+
+    narrative_prompt = _build_narrative_prompt(eval_results, description)
+    narrative = call_llm(
+        system=_NARRATIVE_SYSTEM,
+        user=narrative_prompt,
+        model=config.qa_llm.model,
+        api_key=config.qa_llm_api_key,
+        max_tokens=1024,
+    )
 
     print(f"\n{'='*50}")
     print("QA AGENT REPORT")
@@ -96,29 +147,29 @@ def report(
     if deep_dives:
         print(deep_dives)
 
+    if advice:
+        print(f"\n{'='*50}")
+        print("PROMPT ADVISOR")
+        print(f"{'='*50}")
+        print(advice)
+
+    from datetime import datetime, timezone
+    timestamp = datetime.now(timezone.utc).isoformat()
+    run_data = build_run_data(
+        eval_results=eval_results,
+        description=description,
+        narrative=narrative,
+        advice=advice,
+        scenario_id=scenario_id,
+        timestamp=timestamp,
+        agent_context=agent_context,
+    )
+
     if output_path:
-        json_data = {
-            "summary": narrative,
-            "pass_rate": passed / total if total else 0.0,
-            "results": [
-                {
-                    "id": r.run_result.test_case.id,
-                    "description": r.run_result.test_case.description,
-                    "category": r.run_result.test_case.category,
-                    "passed": r.passed,
-                    "score": r.score,
-                    "rationale": r.rationale,
-                    "failure_detail": r.failure_detail,
-                    "turns": [
-                        {"sent": t.sent, "received": t.received}
-                        for t in r.run_result.turns
-                    ],
-                }
-                for r in eval_results
-            ],
-        }
         with open(output_path, "w") as f:
-            json.dump(json_data, f, indent=2)
+            json.dump(run_data, f, indent=2)
+        logger.info("Report saved to %s", output_path)
         print(f"\nReport saved to: {output_path}")
 
-    return 0 if all(r.passed for r in eval_results) else 1
+    exit_code = 0 if all(r.passed for r in eval_results) else 1
+    return exit_code, run_data

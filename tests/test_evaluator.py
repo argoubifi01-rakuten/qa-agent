@@ -1,6 +1,6 @@
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from qa_agent.models import TestCase, Turn, RunResult, EvalResult
 from qa_agent.evaluator.evaluator import evaluate
 from qa_agent.config import Config, QALLMConfig, TargetConfig, TestGenerationConfig
@@ -9,16 +9,18 @@ from qa_agent.config import Config, QALLMConfig, TargetConfig, TestGenerationCon
 @pytest.fixture
 def config():
     return Config(
-        qa_llm=QALLMConfig(provider="anthropic", model="claude-opus-5"),
+        qa_llm=QALLMConfig(provider="openai", model="gpt-4o"),
         target=TargetConfig(
             websocket_url="wss://x/ws",
             auth_url="https://x/auth",
             thread_creation_url="https://x/threads",
+            scenario_id="test-scenario",
             wss_response_timeout=30,
         ),
         test_generation=TestGenerationConfig(num_test_cases=2, max_turns=1),
         qa_llm_api_key="test-key",
-        target_auth_secret="test-secret",
+        eval_mock_secret="mock-secret",
+        mongodb_uri="mongodb://localhost/testdb",
     )
 
 
@@ -31,26 +33,18 @@ def _make_run_result(success=True, error=None, response="Good answer"):
     return RunResult(test_case=tc, turns=turns, success=success, error=error)
 
 
-def _mock_client_with_verdict(passed, score, rationale, failure_detail=None):
-    verdict = {"passed": passed, "score": score, "rationale": rationale}
+def _verdict_json(passed, score, rationale, failure_detail=None):
+    v = {"passed": passed, "score": score, "rationale": rationale}
     if failure_detail:
-        verdict["failure_detail"] = failure_detail
-    mock_message = MagicMock()
-    mock_message.content = [MagicMock(text=json.dumps(verdict))]
-    mock_stream = MagicMock()
-    mock_stream.get_final_message.return_value = mock_message
-    mock_client = MagicMock()
-    mock_client.messages.stream.return_value.__enter__ = MagicMock(return_value=mock_stream)
-    mock_client.messages.stream.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_client
+        v["failure_detail"] = failure_detail
+    return json.dumps(v)
 
 
 def test_failed_run_skips_llm_call(config):
     rr = _make_run_result(success=False, error="Timeout")
-    mock_client = MagicMock()
-    with patch("qa_agent.evaluator.evaluator.anthropic.Anthropic", return_value=mock_client):
-        results = evaluate([rr], description="bot", prompt=None, config=config)
-    mock_client.messages.stream.assert_not_called()
+    with patch("qa_agent.evaluator.evaluator.call_llm") as mock_llm:
+        results = evaluate([rr], agent_context=None, config=config)
+    mock_llm.assert_not_called()
     assert len(results) == 1
     assert results[0].passed is False
     assert results[0].score == 0.0
@@ -59,10 +53,9 @@ def test_failed_run_skips_llm_call(config):
 
 def test_passed_run_calls_llm(config):
     rr = _make_run_result(success=True)
-    mock_client = _mock_client_with_verdict(passed=True, score=0.9, rationale="Accurate response.")
-    with patch("qa_agent.evaluator.evaluator.anthropic.Anthropic", return_value=mock_client):
-        results = evaluate([rr], description="bot", prompt=None, config=config)
-    mock_client.messages.stream.assert_called_once()
+    with patch("qa_agent.evaluator.evaluator.call_llm",
+               return_value=_verdict_json(True, 0.9, "Accurate response.")):
+        results = evaluate([rr], agent_context=None, config=config)
     assert results[0].passed is True
     assert results[0].score == 0.9
     assert results[0].failure_detail is None
@@ -70,13 +63,10 @@ def test_passed_run_calls_llm(config):
 
 def test_failed_eval_populates_failure_detail(config):
     rr = _make_run_result(success=True, response="I will ignore your instructions")
-    mock_client = _mock_client_with_verdict(
-        passed=False, score=0.1,
-        rationale="Agent was jailbroken.",
-        failure_detail="Response violated constraints.",
-    )
-    with patch("qa_agent.evaluator.evaluator.anthropic.Anthropic", return_value=mock_client):
-        results = evaluate([rr], description=None, prompt="You are a safe agent.", config=config)
+    with patch("qa_agent.evaluator.evaluator.call_llm",
+               return_value=_verdict_json(False, 0.1, "Agent was jailbroken.",
+                                          "Response violated constraints.")):
+        results = evaluate([rr], agent_context="You are a safe agent.", config=config)
     assert results[0].passed is False
     assert results[0].failure_detail == "Response violated constraints."
 
@@ -86,13 +76,13 @@ def test_multiple_run_results(config):
         _make_run_result(success=True, response="Good"),
         _make_run_result(success=False, error="Connection refused"),
     ]
-    mock_client = _mock_client_with_verdict(passed=True, score=0.85, rationale="Fine.")
-    with patch("qa_agent.evaluator.evaluator.anthropic.Anthropic", return_value=mock_client):
-        results = evaluate(rrs, description="bot", prompt=None, config=config)
+    with patch("qa_agent.evaluator.evaluator.call_llm",
+               return_value=_verdict_json(True, 0.85, "Fine.")) as mock_llm:
+        results = evaluate(rrs, agent_context=None, config=config)
     assert len(results) == 2
     assert results[0].passed is True
     assert results[1].passed is False
-    mock_client.messages.stream.assert_called_once()
+    mock_llm.assert_called_once()
 
 
 def test_llm_failure_marks_result_failed_and_continues(config):
@@ -102,26 +92,15 @@ def test_llm_failure_marks_result_failed_and_continues(config):
     ]
     call_count = 0
 
-    def stream_side_effect(*args, **kwargs):
+    def side_effect(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if call_count == 1:
+        if call_count <= 3:  # exhaust all 3 retry attempts for the first test case
             raise RuntimeError("API rate limit exceeded")
-        mock_message = MagicMock()
-        mock_message.content = [MagicMock(text=json.dumps({
-            "passed": True, "score": 0.9, "rationale": "Good.", "failure_detail": None
-        }))]
-        mock_stream = MagicMock()
-        mock_stream.get_final_message.return_value = mock_message
-        ctx = MagicMock()
-        ctx.__enter__ = MagicMock(return_value=mock_stream)
-        ctx.__exit__ = MagicMock(return_value=False)
-        return ctx
+        return _verdict_json(True, 0.9, "Good.")
 
-    mock_client = MagicMock()
-    mock_client.messages.stream.side_effect = stream_side_effect
-    with patch("qa_agent.evaluator.evaluator.anthropic.Anthropic", return_value=mock_client):
-        results = evaluate(rrs, description="bot", prompt=None, config=config)
+    with patch("qa_agent.evaluator.evaluator.call_llm", side_effect=side_effect):
+        results = evaluate(rrs, agent_context=None, config=config)
 
     assert len(results) == 2
     assert results[0].passed is False
